@@ -1,0 +1,17 @@
+venv/
+data/
+90 different animals/
+Body parts dataset/
+flowers/ 
+ISIC_2019_test/
+ISIC_2019_training/
+Midas_photos_data/
+Nature data/
+not lesion images/
+ADAE/
+Nature data/
+MIDAS_excel.xlsx
+Adjusting the ADAE Model for Lesion vs. Non-Lesion Classification_5.pdf
+Designing a Flexible Adversarial Denoising Autoencoder (ADAE) Model_4.pdf
+Nature data.zip
+Skin Cancer Detection\Skin cancer detection.code-workspace
