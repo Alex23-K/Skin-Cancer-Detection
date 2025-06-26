@@ -43,7 +43,7 @@ An AI-powered skin lesion analysis tool using advanced deep learning techniques 
 ## 📊 Model Performance
 
 - **Architecture**: MobileNetV4ConvMedium with fusion layers
-- **Training Dataset**: 148,000+ professionally annotated skin images
+- **Training Dataset**: 36 985 professionally annotated skin images + 111 490 non lesion images from 3 databases
 - **Validation**: Rigorous testing on diverse skin types and conditions
 - **Optimization**: Balanced for sensitivity and specificity across all classes
 
