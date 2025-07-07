@@ -1,0 +1,623 @@
+# Skin Cancer Detection - Data Preprocessing
+# A comprehensive data preprocessing pipeline for skin lesion classification
+# Author: Alex Kagan
+# Project: Multimodal Skin Lesion Classification using Deep Learning
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import sys
+from pathlib import Path
+from collections import Counter
+import warnings
+warnings.filterwarnings('ignore')
+
+# Deep Learning Libraries
+import torch
+import torch.nn as nn
+from torchvision import datasets, transforms
+from torch.utils.data import Dataset, DataLoader, random_split
+from PIL import Image
+
+# Machine Learning Libraries
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+print("=" * 60)
+print("SKIN CANCER DETECTION - DATA PREPROCESSING PIPELINE")
+print("=" * 60)
+print(f"PyTorch Version: {torch.__version__}")
+print(f"CUDA Available: {torch.cuda.is_available()}")
+
+# Device Configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# CPU Configuration for DataLoader
+cpu_cores = os.cpu_count() or 1
+num_workers = max(1, cpu_cores - 2)
+print(f"CPU cores: {cpu_cores}, DataLoader workers: {num_workers}")
+print("=" * 60)
+
+# =============================================================================
+# PROJECT CONFIGURATION
+# =============================================================================
+
+class ProjectConfig:
+    """Configuration class for project paths and parameters"""
+    
+    def __init__(self, base_path=None):
+        if base_path is None:
+            self.base_path = Path.cwd()
+        else:
+            self.base_path = Path(base_path)
+        
+        # Data paths (adjust these to your project structure)
+        self.isic_data_path = self.base_path / "data" / "ISIC_2019_data" / "combined_df_ISIC_2019.xlsx"
+        self.midas_excel_path = self.base_path / "data" / "MIDAS_excel.xlsx"
+        self.midas_images_path = self.base_path / "data" / "Midas_photos_data"
+        self.non_lesion_images_path = self.base_path / "data" / "not_lesion_images"
+        
+        # Output paths
+        self.output_path = self.base_path / "processed_data"
+        self.output_path.mkdir(exist_ok=True)
+        
+    def validate_paths(self):
+        """Validate that all required data paths exist"""
+        paths_to_check = [
+            self.isic_data_path,
+            self.midas_excel_path,
+            self.midas_images_path,
+            self.non_lesion_images_path
+        ]
+        
+        for path in paths_to_check:
+            if not path.exists():
+                print(f"⚠️  WARNING: {path} not found")
+                return False
+        
+        print("✅ All data paths validated successfully")
+        return True
+
+# Initialize configuration
+config = ProjectConfig()
+
+# =============================================================================
+# DATA LOADING AND INITIAL PROCESSING
+# =============================================================================
+
+def load_isic_data(file_path):
+    """Load and preprocess ISIC 2019 dataset"""
+    print("📊 Loading ISIC 2019 dataset...")
+    
+    if not file_path.exists():
+        print(f"❌ ISIC data not found at {file_path}")
+        return None
+    
+    isic_data = pd.read_excel(file_path)
+    
+    # Standardize melanoma labels
+    isic_data['midas_path'] = np.where(
+        isic_data['midas_path'] == "MEL", 
+        "melanoma", 
+        isic_data['midas_path']
+    )
+    
+    print(f"✅ ISIC data loaded: {isic_data.shape}")
+    return isic_data
+
+def load_midas_data(file_path):
+    """Load and preprocess MIDAS dataset"""
+    print("📊 Loading MIDAS dataset...")
+    
+    if not file_path.exists():
+        print(f"❌ MIDAS data not found at {file_path}")
+        return None
+    
+    midas_data = pd.read_excel(file_path)
+    
+    # Remove control images (never biopsied)
+    midas_data = midas_data[
+        midas_data['midas_iscontrol'].str.lower() != "yes"
+    ].copy().reset_index(drop=True)
+    
+    print(f"✅ MIDAS data loaded (excluding controls): {midas_data.shape}")
+    return midas_data
+
+# =============================================================================
+# DIAGNOSIS CLASSIFICATION SYSTEM
+# =============================================================================
+
+class DiagnosisClassifier:
+    """Advanced diagnosis classification system for skin lesions"""
+    
+    def __init__(self):
+        # Define classification keywords
+        self.MELANOMA_KEYWORDS = [
+            '11-malignant-melanoma',
+            'malignant-melanoma',
+            'melanoma'
+        ]
+        
+        self.OTHER_CANCER_KEYWORDS = [
+            '7-malignant-bcc',        # Basal Cell Carcinoma
+            '8-malignant-scc',        # Squamous Cell Carcinoma
+            '9-malignant-sccis',      # SCC in Situ
+            '10-malignant-ak',        # Actinic Keratosis
+            '12-malignant-other',     # Other malignant
+            'malignant-bcc', 'malignant-scc', 'malignant-sccis',
+            'malignant-ak', 'malignant-other',
+            'bcc', 'scc', 'sccis', 'ak',
+            'actinic keratosis', 'carcinoma',
+            'other skin cancer'
+        ]
+        
+        self.BENIGN_KEYWORDS = [
+            '1-benign-melanocytic nevus',
+            '2-benign-seborrheic keratosis',
+            '3-benign-fibrous papule',
+            '4-benign-dermatofibroma',
+            '5-benign-hemangioma',
+            '6-benign-other',
+            'benign-melanocytic nevus', 'benign-seborrheic keratosis',
+            'benign-fibrous papule', 'benign-dermatofibroma',
+            'benign-hemangioma', 'nevus', 'seborrheic keratosis',
+            'fibrous papule', 'dermatofibroma', 'hemangioma',
+            'bkl', 'df', 'vasc', 'benign-other'
+        ]
+        
+        self.BENIGN_EXACT = {'nv', 'bkl', 'df', 'vasc'}
+        
+        self.OTHER_KEYWORDS = [
+            '13-other-melanocytic lesion',
+            '14-other-non-neoplastic/inflammatory',
+            'melanocytic tumor', 'other-non-neoplastic',
+            'inflammatory', 'infectious'
+        ]
+        
+        self.UNKNOWN_KEYWORDS = ['', 'nan', 'na', 'none', 'unk', 'unknown']
+    
+    def pick_best_diagnosis(self, row):
+        """
+        Determine the best diagnosis using hierarchical logic:
+        1. Histology (midas_path) if available
+        2. Consensus from clinical impressions
+        3. Fallback based on melanoma flag
+        """
+        # Check histology first
+        midas_path = row.get('midas_path', np.nan)
+        if pd.notna(midas_path) and str(midas_path).strip() not in ['', '0']:
+            return midas_path
+        
+        # Check clinical impressions for consensus
+        impressions = []
+        for col in ['clinical_impression_1', 'clinical_impression_2', 'clinical_impression_3']:
+            val = row.get(col)
+            if pd.notna(val) and str(val).strip() not in ['', '0']:
+                impressions.append(str(val).strip().lower())
+        
+        # Look for consensus (2+ agree)
+        if impressions:
+            counts = Counter(impressions)
+            most_common, freq = counts.most_common(1)[0]
+            if freq >= 2:
+                return most_common
+        
+        # Fallback logic
+        midas_melanoma = row.get('midas_melanoma', np.nan)
+        if isinstance(midas_melanoma, str) and midas_melanoma.strip().lower() == 'yes':
+            return 'other skin cancer'
+        else:
+            return 'benign-other'
+    
+    def diagnosis_to_label(self, best_diag, is_from_non):
+        """
+        Convert diagnosis to integer labels:
+        0 → Melanoma Detected
+        1 → Other Skin Cancer Detected
+        2 → Benign Skin Lesion Detected
+        3 → No Concerning Lesion Detected
+        """
+        # Non-lesion images
+        if is_from_non is True:
+            return 3
+        
+        # Normalize diagnosis text
+        if best_diag is None or (isinstance(best_diag, float) and pd.isna(best_diag)):
+            txt = ""
+        else:
+            txt = str(best_diag).strip().lower()
+        
+        # Missing/Unknown
+        if txt in self.UNKNOWN_KEYWORDS:
+            return 3
+        
+        # Check for inflammatory/infectious conditions
+        if any(kw in txt for kw in ['non-neoplastic', 'inflammatory', 'infectious']):
+            return 3
+        
+        # Melanoma
+        if any(kw in txt for kw in self.MELANOMA_KEYWORDS):
+            return 0
+        
+        # Other cancers
+        if any(kw in txt for kw in self.OTHER_CANCER_KEYWORDS):
+            return 1
+        
+        # Benign lesions
+        if any(kw in txt for kw in self.BENIGN_KEYWORDS) or txt in self.BENIGN_EXACT:
+            return 2
+        
+        # Atypical/uncertain lesions
+        if any(kw in txt for kw in self.OTHER_KEYWORDS):
+            if any(melanocytic_kw in txt for melanocytic_kw in ['13-', 'melanocytic tumor']):
+                return 1
+            return 3
+        
+        # Default to benign
+        return 2
+
+# =============================================================================
+# IMAGE FILE MANAGEMENT
+# =============================================================================
+
+def resolve_image_filenames(df, image_dir):
+    """
+    Resolve image filenames by matching first 15 characters (case-insensitive)
+    This handles variations in file extensions and suffixes
+    """
+    print(f"🔍 Resolving image filenames in {image_dir}")
+    
+    if not image_dir.exists():
+        print(f"❌ Image directory not found: {image_dir}")
+        return df
+    
+    # List all files in directory
+    folder_files = os.listdir(image_dir)
+    
+    def match_filename(base_name):
+        """Match filename by first 15 characters"""
+        if pd.isna(base_name):
+            return None
+        
+        base_prefix = str(base_name)[:15].lower()
+        for fname in folder_files:
+            if fname[:15].lower() == base_prefix:
+                return fname
+        return None
+    
+    # Create resolved filename column
+    df['resolved_name'] = df['midas_file_name'].apply(match_filename)
+    
+    # Report missing files
+    missing_mask = df['resolved_name'].isna()
+    n_missing = missing_mask.sum()
+    
+    if n_missing > 0:
+        print(f"⚠️  {n_missing} files not found and will be removed")
+        df = df[~missing_mask].reset_index(drop=True)
+    
+    # Update filename column
+    df['midas_file_name'] = df['resolved_name']
+    df = df.drop(columns=['resolved_name'])
+    
+    print(f"✅ Image filename resolution complete: {len(df)} files matched")
+    return df
+
+def create_non_lesion_dataframe(non_lesion_dir):
+    """Create DataFrame for non-lesion images"""
+    print(f"📁 Processing non-lesion images from {non_lesion_dir}")
+    
+    if not non_lesion_dir.exists():
+        print(f"❌ Non-lesion directory not found: {non_lesion_dir}")
+        return pd.DataFrame()
+    
+    valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
+    
+    non_rows = []
+    for fname in os.listdir(non_lesion_dir):
+        if Path(fname).suffix.lower() in valid_extensions:
+            non_rows.append({
+                'midas_file_name': fname,
+                'midas_age': np.nan,
+                'midas_gender': "",
+                'midas_path': "",
+                'clinical_impression_1': "",
+                'clinical_impression_2': "",
+                'clinical_impression_3': "",
+                'best_diagnosis': "",
+            })
+    
+    non_df = pd.DataFrame(non_rows)
+    print(f"✅ Non-lesion DataFrame created: {len(non_df)} images")
+    return non_df
+
+# =============================================================================
+# FEATURE ENGINEERING
+# =============================================================================
+
+def create_demographic_features(df):
+    """Create normalized demographic features"""
+    print("🔧 Creating demographic features...")
+    
+    # Age normalization (0-1 scale, assuming max age ~100)
+    df['age_norm'] = df['midas_age'].apply(
+        lambda x: float(x)/100.0 if pd.notna(x) else 0.0
+    )
+    
+    # Gender encoding
+    def encode_gender(g):
+        s = str(g).strip().lower()
+        if s in ['male', 'm']:
+            return 0.0
+        elif s in ['female', 'f']:
+            return 1.0
+        else:
+            return 0.0  # Default for missing/unknown
+    
+    df['gender_enc'] = df['midas_gender'].apply(encode_gender)
+    
+    print("✅ Demographic features created")
+    return df
+
+# =============================================================================
+# MAIN PROCESSING PIPELINE
+# =============================================================================
+
+def main_preprocessing_pipeline():
+    """Execute the complete data preprocessing pipeline"""
+    
+    print("\n🚀 STARTING DATA PREPROCESSING PIPELINE")
+    print("=" * 60)
+    
+    # Validate paths
+    if not config.validate_paths():
+        print("❌ Path validation failed. Please check your data directories.")
+        return None
+    
+    # Load datasets
+    isic_data = load_isic_data(config.isic_data_path)
+    midas_data = load_midas_data(config.midas_excel_path)
+    
+    if isic_data is None or midas_data is None:
+        print("❌ Failed to load required datasets")
+        return None
+    
+    # Combine ISIC and MIDAS data
+    print("\n🔗 Combining ISIC and MIDAS datasets...")
+    combined_lesion_data = pd.concat(
+        [midas_data, isic_data], 
+        ignore_index=True, 
+        sort=False
+    ).reset_index(drop=True)
+    print(f"✅ Combined lesion data: {combined_lesion_data.shape}")
+    
+    # Initialize diagnosis classifier
+    classifier = DiagnosisClassifier()
+    
+    # Generate best diagnosis
+    print("\n🧠 Generating best diagnosis...")
+    combined_lesion_data['best_diagnosis'] = combined_lesion_data.apply(
+        classifier.pick_best_diagnosis, axis=1
+    )
+    
+    # Remove rows without filename or diagnosis
+    before_filter = len(combined_lesion_data)
+    combined_lesion_data = combined_lesion_data.dropna(
+        subset=['midas_file_name', 'best_diagnosis']
+    ).reset_index(drop=True)
+    after_filter = len(combined_lesion_data)
+    print(f"📊 Filtered data: {before_filter} → {after_filter} rows")
+    
+    # Resolve image filenames
+    combined_lesion_data = resolve_image_filenames(
+        combined_lesion_data, 
+        config.midas_images_path
+    )
+    
+    # Create non-lesion dataset
+    non_lesion_data = create_non_lesion_dataframe(config.non_lesion_images_path)
+    
+    # Mark dataset sources
+    combined_lesion_data['is_from_non'] = False
+    non_lesion_data['is_from_non'] = True
+    
+    # Combine all data
+    print("\n🔄 Combining lesion and non-lesion data...")
+    final_combined_data = pd.concat(
+        [combined_lesion_data, non_lesion_data], 
+        ignore_index=True, 
+        sort=False
+    ).reset_index(drop=True)
+    
+    # Remove duplicates
+    before_dedup = len(final_combined_data)
+    final_combined_data = final_combined_data.drop_duplicates(
+        subset=['midas_file_name'], 
+        keep='first'
+    ).reset_index(drop=True)
+    after_dedup = len(final_combined_data)
+    print(f"🔍 Duplicate removal: {before_dedup} → {after_dedup} rows")
+    
+    # Generate labels
+    print("\n🏷️  Generating classification labels...")
+    final_combined_data['label'] = final_combined_data.apply(
+        lambda row: classifier.diagnosis_to_label(
+            row.get('best_diagnosis'),
+            row.get('is_from_non')
+        ),
+        axis=1
+    )
+    
+    # Create demographic features
+    final_combined_data = create_demographic_features(final_combined_data)
+    
+    # Remove unnecessary columns
+    if 'Unnamed: 0' in final_combined_data.columns:
+        final_combined_data = final_combined_data.drop(columns=['Unnamed: 0'])
+    
+    return final_combined_data
+
+# =============================================================================
+# ANALYSIS AND REPORTING
+# =============================================================================
+
+def generate_dataset_report(df):
+    """Generate comprehensive dataset analysis report"""
+    
+    print("\n📊 DATASET ANALYSIS REPORT")
+    print("=" * 60)
+    
+    # Basic statistics
+    print(f"Total samples: {len(df):,}")
+    print(f"Total features: {len(df.columns)}")
+    
+    # Label distribution
+    print("\n🏷️  Label Distribution:")
+    label_names = {
+        0: "Melanoma Detected",
+        1: "Other Skin Cancer Detected", 
+        2: "Benign Skin Lesion Detected",
+        3: "No Concerning Lesion Detected"
+    }
+    
+    label_counts = df['label'].value_counts().sort_index()
+    for label, count in label_counts.items():
+        percentage = (count / len(df)) * 100
+        print(f"  {label} - {label_names[label]}: {count:,} ({percentage:.1f}%)")
+    
+    # Data source distribution
+    print(f"\n📁 Data Sources:")
+    lesion_count = (~df['is_from_non']).sum()
+    non_lesion_count = df['is_from_non'].sum()
+    print(f"  Lesion images: {lesion_count:,}")
+    print(f"  Non-lesion images: {non_lesion_count:,}")
+    
+    # Demographic information (for lesion data only)
+    lesion_data = df[~df['is_from_non']]
+    if len(lesion_data) > 0:
+        print(f"\n👥 Demographics (Lesion Data Only):")
+        
+        # Age statistics
+        age_data = lesion_data['midas_age'].dropna()
+        if len(age_data) > 0:
+            print(f"  Age - Mean: {age_data.mean():.1f}, "
+                  f"Std: {age_data.std():.1f}, "
+                  f"Range: {age_data.min():.0f}-{age_data.max():.0f}")
+        
+        # Gender distribution
+        gender_counts = lesion_data['midas_gender'].value_counts()
+        print(f"  Gender distribution:")
+        for gender, count in gender_counts.items():
+            if str(gender).strip():  # Skip empty strings
+                print(f"    {gender}: {count:,}")
+    
+    # Missing data analysis
+    print(f"\n❓ Missing Data Analysis:")
+    missing_summary = df.isnull().sum()
+    missing_summary = missing_summary[missing_summary > 0].sort_values(ascending=False)
+    
+    if len(missing_summary) > 0:
+        for col, missing_count in missing_summary.items():
+            percentage = (missing_count / len(df)) * 100
+            print(f"  {col}: {missing_count:,} ({percentage:.1f}%)")
+    else:
+        print("  No missing data found")
+    
+    print("=" * 60)
+
+def save_processed_data(df, output_path):
+    """Save processed data in multiple formats"""
+    
+    print(f"\n💾 Saving processed data to {output_path}")
+    
+    # Save as pickle (preserves all data types)
+    pickle_path = output_path / "processed_skin_lesion_data.pkl"
+    df.to_pickle(pickle_path)
+    print(f"✅ Saved pickle file: {pickle_path}")
+    
+    # Save as CSV (for broader compatibility)
+    csv_path = output_path / "processed_skin_lesion_data.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"✅ Saved CSV file: {csv_path}")
+    
+    # Save metadata
+    metadata = {
+        'total_samples': len(df),
+        'total_features': len(df.columns),
+        'label_distribution': df['label'].value_counts().to_dict(),
+        'data_sources': {
+            'lesion_images': int((~df['is_from_non']).sum()),
+            'non_lesion_images': int(df['is_from_non'].sum())
+        },
+        'feature_columns': df.columns.tolist()
+    }
+    
+    metadata_path = output_path / "dataset_metadata.txt"
+    with open(metadata_path, 'w') as f:
+        f.write("SKIN LESION DATASET METADATA\n")
+        f.write("=" * 40 + "\n\n")
+        for key, value in metadata.items():
+            f.write(f"{key}: {value}\n")
+    
+    print(f"✅ Saved metadata: {metadata_path}")
+
+# =============================================================================
+# EXECUTION
+# =============================================================================
+
+if __name__ == "__main__":
+    
+    # Execute preprocessing pipeline
+    processed_data = main_preprocessing_pipeline()
+    
+    if processed_data is not None:
+        # Generate analysis report
+        generate_dataset_report(processed_data)
+        
+        # Save processed data
+        save_processed_data(processed_data, config.output_path)
+        
+        print(f"\n🎉 PREPROCESSING COMPLETED SUCCESSFULLY!")
+        print(f"📊 Final dataset shape: {processed_data.shape}")
+        print(f"💾 Data saved to: {config.output_path}")
+        
+    else:
+        print("❌ Preprocessing failed. Please check your data and try again.")
+
+# =============================================================================
+# USAGE EXAMPLE
+# =============================================================================
+
+"""
+USAGE INSTRUCTIONS:
+
+1. Data Setup:
+   - Create a 'data' folder in your project directory
+   - Place your datasets in the following structure:
+     data/
+     ├── ISIC_2019_data/
+     │   └── combined_df_ISIC_2019.xlsx
+     ├── MIDAS_excel.xlsx
+     ├── Midas_photos_data/
+     │   └── [image files]
+     └── not_lesion_images/
+         └── [non-lesion image files]
+
+2. Run the preprocessing:
+   - Execute this script: python skin_cancer_preprocessing.py
+   - Or run in Jupyter: execute all cells
+
+3. Output:
+   - Processed data will be saved in 'processed_data/' folder
+   - Available formats: .pkl, .csv, and metadata.txt
+
+4. Label Meanings:
+   - 0: Melanoma Detected
+   - 1: Other Skin Cancer Detected  
+   - 2: Benign Skin Lesion Detected
+   - 3: No Concerning Lesion Detected
+
+For questions or issues, please refer to the project documentation.
+"""
